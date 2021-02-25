@@ -20,22 +20,29 @@ import argparse
 
 import numpy as np
 import paddle
+from paddle import inference
 from paddle.io import DataLoader, Dataset
 from paddlenlp.transformers import GPT2Model, GPT2ForPretraining
-from paddlenlp.transformers import GPT2Tokenizer
+from paddlenlp.transformers import GPT2Tokenizer, GPT2ChineseTokenizer
 from paddlenlp.transformers import GPT2Model
 from paddlenlp.data import Stack, Tuple, Pad
 from paddlenlp.utils.log import logger
 
 MODEL_CLASSES = {
-    "gpt2-small-en": (GPT2ForPretraining, GPT2Tokenizer),
-    "gpt2-medium-en": (GPT2ForPretraining, GPT2Tokenizer),
-    "gpt2-large-en": (GPT2ForPretraining, GPT2Tokenizer),
+    "gpt2-cn": (GPT2ForPretraining, GPT2ChineseTokenizer),
+    "gpt2": (GPT2ForPretraining, GPT2Tokenizer),
 }
 
 # yapf: disable
 parser = argparse.ArgumentParser()
-parser.add_argument("--model_name_or_path", default=None, type=str, required=True, help="Path to pre-trained model or shortcut name selected in the list: "
+parser.add_argument(
+    "--model_type",
+    default=None,
+    type=str,
+    required=True,
+    help="Model type selected in the list: " +
+    ", ".join(MODEL_CLASSES.keys()), )
+parser.add_argument("--model_path", default=None, type=str, required=True, help="Path to pre-trained model or shortcut name selected in the list: "
         + ", ".join(sum([list(classes[-1].pretrained_init_configuration.keys()) for classes in MODEL_CLASSES.values()], [])), )
 parser.add_argument("--eval_path", default=None, type=str, required=True, help="The eval file path.", )
 parser.add_argument('--cloze_eval', action='store_true', help='Evaluation dataset from `--eval_path` is a cloze task')
@@ -45,6 +52,7 @@ parser.add_argument( "--batch_size", default=8, type=int, help="Batch size per G
 parser.add_argument('--seq_length', type=int, default=1024, help='Maximum sequence length to process for evaluation.')
 parser.add_argument("--device", type=str, default="gpu", help="Select cpu, gpu, xpu devices.")
 parser.add_argument("--logging_steps", type=int, default=100, help="Log every X updates steps.")
+
 # yapf: enable
 
 
@@ -196,7 +204,7 @@ def create_eval_dataset(args):
     eval_batch_size = args.batch_size
     seq_len = args.seq_length
 
-    tokenizer = GPT2Tokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = GPT2Tokenizer.from_pretrained(os.path.dirname(args.model_path))
     pad_token = tokenizer.command_name_map["pad"].Id
 
     if not args.cloze_eval:
@@ -236,35 +244,107 @@ def create_eval_dataset(args):
     return val_dataloader
 
 
+class Predictor(object):
+    def __init__(self, predictor, input_handles, output_handles):
+        self.predictor = predictor
+        self.input_handles = input_handles
+        self.output_handles = output_handles
+
+    @classmethod
+    def create_predictor(cls, args):
+        config = paddle.inference.Config(args.model_path + ".pdmodel",
+                                         args.model_path + ".pdiparams")
+        if args.device == "gpu":
+            # set GPU configs accordingly
+            config.enable_use_gpu(100, 0)
+        elif args.select_device == "cpu":
+            # set CPU configs accordingly,
+            # such as enable_mkldnn, set_cpu_math_library_num_threads
+            config.disable_gpu()
+        elif args.select_device == "xpu":
+            # set XPU configs accordingly
+            config.enable_xpu(100)
+        config.switch_use_feed_fetch_ops(False)
+        predictor = paddle.inference.create_predictor(config)
+        input_handles = [
+            predictor.get_input_handle(name)
+            for name in predictor.get_input_names()
+        ]
+        #print("input_handles", predictor.get_input_names())
+        output_handles = [
+            predictor.get_input_handle(name)
+            for name in predictor.get_output_names()
+        ]
+        return cls(predictor, input_handles, output_handles)
+
+    def predict_batch(self, data):
+        for input_field, input_handle in zip(data, self.input_handles):
+            print(data)
+            #print(data.shape)
+            input_handle.copy_from_cpu(input_field.numpy() if isinstance(
+                input_field, paddle.Tensor) else input_field)
+        self.predictor.run()
+        output = [
+            output_handle.copy_to_cpu() for output_handle in self.output_handles
+        ]
+        return output
+
+    def predict(self, dataset, batch_size=1):
+        outputs = []
+        for data in dataset:
+            output = self.predict_batch(data)
+            print(output)
+            outputs.append(output)
+        # print(outputs)
+        #print(outputs[0])
+        return outputs
+
+
+def main():
+    args = parse_args()
+    predictor = Predictor.create_predictor(args)
+    args.model_type = args.model_type.lower()
+    model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    tokenizer = tokenizer_class.from_pretrained(
+        os.path.dirname(args.model_path))
+    ds = ["问题：中国的首都是哪里？答案：北京。\n问题：百度的厂长是谁? 答案："]
+    if args.model_type == "gpt2":
+        ds = [
+            "Question: Where is the capital of China? Answer: Beijing. \nQuestion: Who is the CEO of Apple? Answer:",
+        ]
+    dataset = [
+        np.array(tokenizer.encode(text)).astype("int64").reshape([1, 1, -1])
+        for text in ds
+    ]
+    print(dataset[0])
+    print(dataset[0].shape)
+    for out in predictor.predict(dataset):
+        pass
+
+
 def do_eval(args):
     assert args.device in [
         "cpu", "gpu", "xpu"
     ], "Invalid device! Available device should be cpu, gpu, or xpu."
-    paddle.set_device(args.device)
-    model_class, tokenizer_class = MODEL_CLASSES[args.model_name_or_path]
-    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
+    #paddle.set_device(args.device)
+    paddle.set_device("cpu")
+    predictor = Predictor.create_predictor(args)
+    args.model_type = args.model_type.lower()
 
-    if args.init_checkpoint_path is not None:
-        model = GPT2ForPretraining(
-            GPT2Model(**model_class.pretrained_init_configuration[
-                args.model_name_or_path]))
-
-        logger.info("Load model checkpoint from %s" % args.init_checkpoint_path)
-        model_dict = paddle.load(os.path.join(args.init_checkpoint_path))
-        model.set_dict(model_dict)
-    else:
-        model = model_class.from_pretrained(args.model_name_or_path)
+    model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    tokenizer = tokenizer_class.from_pretrained(
+        os.path.dirname(args.model_path))
 
     tic_eval = time.time()
     eval_data_loader = create_eval_dataset(args)
-    model.eval()
     total_score = 0
     score_name = "loss" if not args.cloze_eval else "number correct"
     with paddle.no_grad():
         for step, batch in enumerate(eval_data_loader):
             tokens, loss_mask, attention_mask, position_ids, labels = batch
-            preds = model(tokens, position_ids, attention_mask)
-            print(preds)
+            preds = predictor.predict_batch(
+                [tokens.numpy(), position_ids.numpy(), attention_mask.numpy()])
+            #preds = model(tokens, position_ids, attention_mask)
             if not args.cloze_eval:
                 masked_lm_loss = paddle.nn.functional.cross_entropy(
                     preds, labels, reduction="none")

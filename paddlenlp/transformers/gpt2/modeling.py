@@ -30,6 +30,7 @@ __all__ = [
     "GPT2PretrainedModel",
     'GPT2ForPretraining',
     'GPT2PretrainingCriterion',
+    'GPT2ForGreedyGeneration',
 ]
 
 
@@ -523,7 +524,7 @@ class GPT2Model(GPT2PretrainedModel):
                 cache=None):
         self.checkpoints = []
         if attention_mask is None:
-            length = input_ids.shape[1]
+            length = paddle.shape(input_ids)[1]
             attention_mask = paddle.tensor.triu(
                 (paddle.ones(
                     (length, length),
@@ -532,10 +533,15 @@ class GPT2Model(GPT2PretrainedModel):
         if position_ids is None:
             past_length = 0
             if cache is not None:
-                past_length = cache[0].k.shape[-2]
+                past_length = paddle.shape(cache[0].k)[-2]
             position_ids = paddle.arange(
-                past_length, input_ids.shape[-1] + past_length, dtype='int64')
-            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+                past_length,
+                paddle.shape(input_ids)[-1] + past_length,
+                dtype='int64')
+            position_ids = position_ids.unsqueeze(0)
+            # .expand_as(input_ids)
+            position_ids = paddle.fluid.layers.expand_as(position_ids,
+                                                         input_ids)
 
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids)
@@ -607,3 +613,58 @@ class GPT2PretrainingCriterion(paddle.nn.Layer):
         masked_lm_loss = paddle.sum(masked_lm_loss.reshape([-1]) * loss_mask)
         loss = masked_lm_loss / loss_mask.sum()
         return loss
+
+
+class GPT2ForGreedyGeneration(GPT2PretrainedModel):
+    """
+    The pretraining model of GPT2.
+    It returns some logits and cached_kvs.
+    """
+
+    def __init__(self, gpt2):
+        super(GPT2ForGreedyGeneration, self).__init__()
+        self.gpt2 = gpt2
+        self.apply(self.init_weights)
+
+    def model(self,
+              input_ids,
+              position_ids=None,
+              attention_mask=None,
+              masked_positions=None,
+              use_cache=False,
+              cache=None):
+        outputs = self.gpt2(
+            input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache,
+            cache=cache)
+        if use_cache:
+            encoder_outputs, cached_kvs = outputs[:2]
+        else:
+            encoder_outputs = outputs
+        logits = paddle.matmul(
+            encoder_outputs,
+            self.gpt2.embeddings.word_embeddings.weight,
+            transpose_y=True)
+
+        if use_cache:
+            return logits, cached_kvs
+        else:
+            return logits
+
+    def forward(self, input_ids, max_predict_len=10):
+        output, cached_kvs = self.model(input_ids, use_cache=True, cache=None)
+        src_ids = paddle.argmax(output[0, -1]).reshape([1, -1])
+        nid = src_ids
+        for i in range(max_predict_len):
+            output, cached_kvs = self.model(
+                nid, use_cache=True, cache=cached_kvs)
+
+            nid = paddle.argmax(output[0, -1]).reshape([1, -1])
+            # if nid is '\n', the predicion is over.
+            # if paddle.sum(nid) == 3:
+            #     break
+            src_ids = paddle.concat([src_ids, nid], axis=1)
+
+        return src_ids
