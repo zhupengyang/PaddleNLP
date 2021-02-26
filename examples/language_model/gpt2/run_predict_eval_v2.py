@@ -22,6 +22,9 @@ import numpy as np
 import paddle
 from paddle import inference
 from paddle.io import DataLoader, Dataset
+
+import sys
+sys.path.append('../../../')
 from paddlenlp.transformers import GPT2Model, GPT2ForPretraining
 from paddlenlp.transformers import GPT2Tokenizer, GPT2ChineseTokenizer
 from paddlenlp.transformers import GPT2Model
@@ -52,6 +55,7 @@ parser.add_argument( "--batch_size", default=8, type=int, help="Batch size per G
 parser.add_argument('--seq_length', type=int, default=1024, help='Maximum sequence length to process for evaluation.')
 parser.add_argument("--device", type=str, default="gpu", help="Select cpu, gpu, xpu devices.")
 parser.add_argument("--logging_steps", type=int, default=100, help="Log every X updates steps.")
+parser.add_argument("--out_file", type=str, default="out_xpu.txt", help="")
 
 # yapf: enable
 
@@ -330,7 +334,7 @@ def do_eval(args):
     ], "Invalid device! Available device should be cpu, gpu, or xpu."
     #paddle.set_device(args.device)
     paddle.set_device("cpu")
-    predictor = Predictor.create_predictor(args)
+    # predictor = Predictor.create_predictor(args)
     args.model_type = args.model_type.lower()
 
     model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
@@ -342,13 +346,13 @@ def do_eval(args):
     total_score = 0
     score_name = "loss" if not args.cloze_eval else "number correct"
     with paddle.no_grad():
+        outs = np.loadtxt(args.out_file, 'int64', delimiter=' ')
         for step, batch in enumerate(eval_data_loader):
-            #tokens, loss_mask, attention_mask, position_ids, labels = batch
+            # tokens, loss_mask, attention_mask, position_ids, labels = batch
             tokens, labels = batch
-            preds = predictor.predict_batch([tokens.numpy()])
-            # print(preds, labels)
-            # continue
-            #preds = model(tokens, position_ids, attention_mask)
+            # preds = predictor.predict_batch([tokens.numpy()])
+            preds = [outs[step]]
+
             if not args.cloze_eval:
                 masked_lm_loss = paddle.nn.functional.cross_entropy(
                     preds, labels, reduction="none")
